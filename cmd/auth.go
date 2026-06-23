@@ -792,3 +792,90 @@ func (a *App) GenerateTOTPQR(c echo.Context) error {
 		QR:     base64.StdEncoding.EncodeToString(buf.Bytes()),
 	}})
 }
+
+// CRMSessionLogin validates a Frappe CRM session cookie and creates a listmonk session.
+// The user arrives here from a Frappe Web Page meta-redirect. The Frappe sid cookie
+// is sent because listmonk is reverse-proxied on the same CRM domain.
+func (a *App) CRMSessionLogin(c echo.Context) error {
+	// Read the Frappe sid cookie.
+	sidCookie, err := c.Cookie("sid")
+	if err != nil || sidCookie.Value == "" || sidCookie.Value == "Guest" {
+		return a.renderLoginPage(c, echo.NewHTTPError(http.StatusUnauthorized,
+			a.i18n.T("users.invalidRequest")))
+	}
+
+	// Validate the Frappe session by calling the CRM API.
+	frappeURL := "https://crm.forschfrontiers.com/api/method/frappe.auth.get_logged_user"
+	req, err := http.NewRequestWithContext(c.Request().Context(), "GET", frappeURL, nil)
+	if err != nil {
+		a.log.Printf("error creating Frappe validation request: %v", err)
+		return a.renderLoginPage(c, echo.NewHTTPError(http.StatusInternalServerError,
+			a.i18n.T("globals.messages.internalError")))
+	}
+	req.Header.Set("Cookie", "sid="+sidCookie.Value)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		a.log.Printf("error calling Frappe get_logged_user: %v", err)
+		return a.renderLoginPage(c, echo.NewHTTPError(http.StatusInternalServerError,
+			a.i18n.T("globals.messages.internalError")))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		a.log.Printf("Frappe session validation returned %d", resp.StatusCode)
+		return a.renderLoginPage(c, echo.NewHTTPError(http.StatusUnauthorized,
+			a.i18n.T("users.invalidRequest")))
+	}
+
+	// Parse the Frappe response to get the user's email.
+	var frappeResp struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&frappeResp); err != nil {
+		a.log.Printf("error decoding Frappe response: %v", err)
+		return a.renderLoginPage(c, echo.NewHTTPError(http.StatusInternalServerError,
+			a.i18n.T("globals.messages.internalError")))
+	}
+
+	email := strings.TrimSpace(frappeResp.Message)
+	if email == "" || email == "Guest" {
+		return a.renderLoginPage(c, echo.NewHTTPError(http.StatusUnauthorized,
+			a.i18n.T("users.invalidRequest")))
+	}
+
+	// Look up the listmonk user by email.
+	user, userErr := a.core.GetUser(0, "", email)
+	if userErr != nil {
+		// If the user doesn't exist, auto-create one.
+		if httpErr, ok := userErr.(*echo.HTTPError); ok && httpErr.Code == http.StatusNotFound {
+			u, err := a.core.CreateUser(auth.User{
+				Type:          auth.UserTypeUser,
+				HasPassword:   false,
+				PasswordLogin: false,
+				Username:      email,
+				Name:          email,
+				Email:         null.NewString(email, true),
+				UserRoleID:    auth.SuperAdminRoleID,
+				Status:        auth.UserStatusEnabled,
+			})
+			if err != nil {
+				a.log.Printf("error creating listmonk user for %s: %v", email, err)
+				return a.renderLoginPage(c, err)
+			}
+			user = u
+			userErr = nil
+		} else {
+			return a.renderLoginPage(c, userErr)
+		}
+	}
+
+	// Create a listmonk session.
+	if err := a.auth.SaveSession(user, "", c); err != nil {
+		return a.renderLoginPage(c, err)
+	}
+
+	// Redirect to the admin dashboard.
+	return c.Redirect(http.StatusFound, uriAdmin)
+}

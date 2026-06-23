@@ -256,6 +256,9 @@ func initHTTPHandlers(e *echo.Echo, a *App) {
 			g.GET("/auth/oidc", a.OIDCFinish)
 		}
 
+		// CRM session bridge — validates Frappe sid cookie, creates listmonk session.
+		g.GET("/auth/crm-session", a.CRMSessionLogin)
+
 		// Public APIs.
 		g.GET("/api/public/lists", a.GetPublicLists)
 		g.POST("/api/public/subscription", a.PublicSubscription)
