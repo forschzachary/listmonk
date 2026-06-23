@@ -241,10 +241,10 @@ func (o *Auth) ExchangeOIDCToken(code, nonce string) (string, OIDCclaim, error) 
 	var claims OIDCclaim
 	if email, ok := tk.Extra("email").(string); ok && email != "" {
 		claims.Email = email
-		if sub, ok := tk.Extra("sub"].(string); ok {
+		if sub, ok := tk.Extra("sub").(string); ok {
 			claims.Sub = sub
 		}
-		if name, ok := tk.Extra("name"].(string); ok {
+		if name, ok := tk.Extra("name").(string); ok {
 			claims.Name = name
 		}
 	}
