@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -157,7 +156,8 @@ func (o *Auth) initOIDC() error {
 	}
 
 	o.verifier = provider.Verifier(&oidc.Config{
-		ClientID: o.cfg.OIDC.ClientID,
+		ClientID:             o.cfg.OIDC.ClientID,
+		SupportedSigningAlgs: []string{"HS256"},
 	})
 
 	o.oauthCfg = oauth2.Config{
@@ -221,8 +221,10 @@ func (o *Auth) GetOIDCAuthURL(state, nonce string) string {
 	return cfg.AuthCodeURL(state, oidc.Nonce(nonce))
 }
 
-// ExchangeOIDCToken takes an OIDC authorization code (recieved via redirect from the OIDC provider),
-// validates it, and returns an OIDC token for subsequent auth.
+// ExchangeOIDCToken takes an OIDC authorization code (received via redirect from the OIDC provider),
+// exchanges it for an access token, and fetches user claims from the userinfo endpoint.
+// Modified for Frappe OAuth2: skips ID token verification (Frappe uses HS256 which go-oidc
+// doesn't support) and always uses the userinfo endpoint instead.
 func (o *Auth) ExchangeOIDCToken(code, nonce string) (string, OIDCclaim, error) {
 	cfg, err := o.getOAuthConfig()
 	if err != nil {
@@ -234,31 +236,20 @@ func (o *Auth) ExchangeOIDCToken(code, nonce string) (string, OIDCclaim, error) 
 		return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("error exchanging token: %v", err))
 	}
 
-	rawIDTk, ok := tk.Extra("id_token").(string)
-	if !ok {
-		return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, "`id_token` missing.")
-	}
-
-	verifier, err := o.getVerifier()
-	if err != nil {
-		return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("error getting verifier: %v", err))
-	}
-
-	idTk, err := verifier.Verify(context.TODO(), rawIDTk)
-	if err != nil {
-		return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("error verifying ID token: %v", err))
-	}
-
-	if idTk.Nonce != nonce {
-		return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, "nonce did not match")
-	}
-
+	// Try to get claims from the access token first (works for providers that include
+	// claims in the token response without requiring ID token verification).
 	var claims OIDCclaim
-	if err := idTk.Claims(&claims); err != nil {
-		return "", OIDCclaim{}, errors.New("error getting user from OIDC")
+	if email, ok := tk.Extra("email").(string); ok && email != "" {
+		claims.Email = email
+		if sub, ok := tk.Extra("sub"].(string); ok {
+			claims.Sub = sub
+		}
+		if name, ok := tk.Extra("name"].(string); ok {
+			claims.Name = name
+		}
 	}
 
-	// If claims doesn't have the e-mail, attempt to fetch it from the userinfo endpoint.
+	// If claims don't have the email, fetch from the userinfo endpoint.
 	if claims.Email == "" {
 		provider, err := o.getProvider()
 		if err != nil {
@@ -267,16 +258,16 @@ func (o *Auth) ExchangeOIDCToken(code, nonce string) (string, OIDCclaim, error) 
 
 		userInfo, err := provider.UserInfo(context.TODO(), oauth2.StaticTokenSource(tk))
 		if err != nil {
-			return "", OIDCclaim{}, errors.New("error fetching user info from OIDC")
+			return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("error fetching user info: %v", err))
 		}
 
 		// Parse the UserInfo claims into the claims struct
 		if err := userInfo.Claims(&claims); err != nil {
-			return "", OIDCclaim{}, errors.New("error parsing user info claims")
+			return "", OIDCclaim{}, echo.NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("error parsing user info claims: %v", err))
 		}
 	}
 
-	return rawIDTk, claims, nil
+	return tk.AccessToken, claims, nil
 }
 
 // Middleware is the HTTP middleware used for wrapping HTTP handlers registered on the echo router.
